@@ -304,7 +304,7 @@ namespace DepotDumper
             Action<SteamApps.DepotKeyCallback> cbMethod = (depotKey) =>
             {
                 completed = true;
-                Console.WriteLine("Got depot key for {0} result: {1}", depotKey.DepotID, depotKey.Result);
+                Console.WriteLine("\tGot depot key for {0} result: {1}", depotKey.DepotID, depotKey.Result);
 
 
                 if (depotKey.Result == EResult.Timeout)
@@ -318,7 +318,7 @@ namespace DepotDumper
                     return;
                 }
 
-                Program.sw.WriteLine($"{depotKey.DepotID};{string.Concat(depotKey.DepotKey.Select(b => b.ToString("X2")).ToArray())}");
+                Program.sw.WriteLine($"{appid};{depotKey.DepotID};{string.Concat(depotKey.DepotKey.Select(b => b.ToString("X2")).ToArray())}");
                 DepotKeys[depotKey.DepotID] = depotKey.DepotKey;
             };
 

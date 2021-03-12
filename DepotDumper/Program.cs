@@ -102,7 +102,7 @@ namespace DepotDumper
                             }
                         }
 
-                        Console.WriteLine("Got AppInfo for {0}: {1}", appId, appName);
+                        Console.WriteLine("\nGot AppInfo for {0}: {1}", appId, appName);
 
                         sw2.WriteLine($"{appId};{appName}");
 
@@ -127,7 +127,7 @@ namespace DepotDumper
                             {
                                 if (attempt > 1)
                                 {
-                                    Console.WriteLine($"Retrying... ({attempt})");
+                                    Console.WriteLine($"\tRetrying... ({attempt})");
                                 }
                                 steam3.RequestDepotKey(id, appId);
                                 attempt++;
