@@ -7,6 +7,7 @@ using System.Collections.ObjectModel;
 using System.IO;
 using System.Linq;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace DepotDumper
 {
@@ -32,6 +33,7 @@ namespace DepotDumper
 
         public Dictionary<uint, byte[]> AppTickets { get; private set; }
         public Dictionary<uint, ulong> AppTokens { get; private set; }
+        public List<uint> AppTokensDenied { get; private set; }
         public Dictionary<uint, byte[]> DepotKeys { get; private set; }
         public ConcurrentDictionary<string, SteamApps.CDNAuthTokenCallback> CDNAuthTokens { get; private set; }
         public Dictionary<uint, SteamApps.PICSProductInfoCallback.PICSProductInfo> AppInfo { get; private set; }
@@ -63,7 +65,7 @@ namespace DepotDumper
         Credentials credentials;
 
         static readonly TimeSpan STEAM3_TIMEOUT = TimeSpan.FromSeconds(30);
-
+        static readonly CancellationTokenSource s_cts = new CancellationTokenSource();
 
         public Steam3Session(SteamUser.LogOnDetails details)
         {
@@ -81,6 +83,7 @@ namespace DepotDumper
 
             this.AppTickets = new Dictionary<uint, byte[]>();
             this.AppTokens = new Dictionary<uint, ulong>();
+            this.AppTokensDenied = new List<uint>();
             this.DepotKeys = new Dictionary<uint, byte[]>();
             this.CDNAuthTokens = new ConcurrentDictionary<string, SteamApps.CDNAuthTokenCallback>();
             this.AppInfo = new Dictionary<uint, SteamApps.PICSProductInfoCallback.PICSProductInfo>();
@@ -124,6 +127,16 @@ namespace DepotDumper
 
             Connect();
         }
+        class AppInfoTaskRes
+        {
+            public int hash;
+            public IEnumerable<SteamApps.PICSProductInfoCallback> res;
+            public AppInfoTaskRes(int hash, IEnumerable<SteamApps.PICSProductInfoCallback> res)
+            {
+                this.hash = hash;
+                this.res = res;
+            }
+        }
 
         public delegate bool WaitCondition();
         public bool WaitUntilCallback(Action submitter, WaitCondition waiter)
@@ -153,64 +166,86 @@ namespace DepotDumper
             return credentials;
         }
 
-        public void RequestAppInfo(uint appId)
+        public async Task<Dictionary<uint, ulong>> RequestAppTokens(IEnumerable<uint> appIds)
         {
-            if (AppInfo.ContainsKey(appId) || bAborted)
-                return;
+            appIds = appIds.Distinct().Where(e => !AppTokens.ContainsKey(e));
+            var job = steamApps.PICSGetAccessTokens(appIds, new List<uint>() { });
+            job.Timeout = TimeSpan.FromSeconds(60);
+            var Tokens = await job;
 
-            bool completed = false;
-            Action<SteamApps.PICSTokensCallback> cbMethodTokens = (appTokens) =>
+            AppTokensDenied = AppTokensDenied.Concat(Tokens.AppTokensDenied).ToList();
+            foreach (var apptoken in Tokens.AppTokens)
             {
-                completed = true;
-                if (appTokens.AppTokensDenied.Contains(appId))
-                {
-                    Console.WriteLine("Insufficient privileges to get access token for app {0}", appId);
-                }
-
-                foreach (var token_dict in appTokens.AppTokens)
-                {
-                    this.AppTokens.Add(token_dict.Key, token_dict.Value);
-                }
-            };
-
-            WaitUntilCallback(() =>
-            {
-                callbacks.Subscribe(steamApps.PICSGetAccessTokens(new List<uint>() { appId }, new List<uint>() { }), cbMethodTokens);
-            }, () => { return completed; });
-
-            completed = false;
-            Action<SteamApps.PICSProductInfoCallback> cbMethod = (appInfo) =>
-            {
-                completed = !appInfo.ResponsePending;
-
-                foreach (var app_value in appInfo.Apps)
-                {
-                    var app = app_value.Value;
-
-                    //Console.WriteLine("Got AppInfo for {0}", app.ID);
-                    AppInfo.Add(app.ID, app);
-                }
-
-                foreach (var app in appInfo.UnknownApps)
-                {
-                    AppInfo.Add(app, null);
-                }
-            };
-
-            SteamApps.PICSRequest request = new SteamApps.PICSRequest(appId);
-            if (AppTokens.ContainsKey(appId))
-            {
-                request.AccessToken = AppTokens[appId];
-                request.Public = false;
+                if (!AppTokens.ContainsKey(apptoken.Key))
+                    AppTokens.Add(apptoken.Key, apptoken.Value);
             }
-
-            WaitUntilCallback(() =>
+            return AppTokens;
+        }
+        private async Task<AppInfoTaskRes> RequestAppInfoChunks(IEnumerable<uint> appIds)
+        {
+            var requests = appIds.Select(appId => new SteamApps.PICSRequest(appId));
+            requests.Select(request =>
             {
-                callbacks.Subscribe(steamApps.PICSGetProductInfo(new List<SteamApps.PICSRequest>() { request }, new List<SteamApps.PICSRequest>() { }), cbMethod);
-            }, () => { return completed; });
+                request.AccessToken = AppTokens[request.ID];
+                request.Public = false;
+                return request;
+            });
+            var appInfos = await steamApps.PICSGetProductInfo(requests, new List<SteamApps.PICSRequest>() { });
+            return new AppInfoTaskRes(appIds.GetHashCode(), appInfos.Results);
         }
 
-        public void RequestPackageInfo(IEnumerable<uint> packageIds)
+        public async Task RequestAppInfos(IEnumerable<uint> appIds)
+        {
+            var Chunks = Util.SplitList(appIds);
+            int totalTasks = Chunks.Count();
+            List<uint> depotsSeen = new List<uint>();
+
+            var tasks = new Dictionary<int, Task<AppInfoTaskRes>>();
+            foreach (IEnumerable<uint> ChunkAppIds in Chunks)
+            {
+                tasks.Add(ChunkAppIds.GetHashCode(), RequestAppInfoChunks(ChunkAppIds));
+            }
+
+            uint i = 0;
+            while (tasks.Count > 0)
+            {
+                var appInfos = await await Task.WhenAny(tasks.Values);
+                tasks.Remove(appInfos.hash);
+                i++;
+
+                Console.Write("\r" + new String(' ', Console.BufferWidth) + "\r");
+                Console.Write($"App info Request {i} of {Chunks.Count()} - {depotsSeen.Count} depot keys");
+                
+                foreach (var AppInfoRes in appInfos.res)
+                {
+                    foreach (var app in AppInfoRes.Apps.Values)
+                    {
+                        if (AppInfo.ContainsKey(app.ID))
+                            continue;
+                        AppInfo.Add(app.ID, app);
+
+                        KeyValue depots = app.KeyValues.Children.Where(c => c.Name == "depots").FirstOrDefault();
+                        if (depots == null)
+                            continue;
+                        foreach (var depotSection in depots.Children)
+                        {
+                            uint id = uint.MaxValue;
+                            if (!uint.TryParse(depotSection.Name, out id) || id == uint.MaxValue)
+                                continue;
+                            if(!depotsSeen.Contains(id))
+                                depotsSeen.Add(id);
+                        }
+                    }
+
+                    foreach (uint appId in AppInfoRes.UnknownApps)
+                    {
+                        AppInfo.TryAdd(appId, null);
+                    }
+                }
+            }
+        }
+
+        public async Task RequestPackageInfo(IEnumerable<uint> packageIds)
         {
             List<uint> packages = packageIds.ToList();
             packages.RemoveAll(pid => PackageInfo.ContainsKey(pid));
@@ -218,11 +253,9 @@ namespace DepotDumper
             if (packages.Count == 0 || bAborted)
                 return;
 
-            bool completed = false;
-            Action<SteamApps.PICSProductInfoCallback> cbMethod = (packageInfo) =>
+            var packageInfos = await steamApps.PICSGetProductInfo(new List<uint>(), packages);
+            foreach(SteamApps.PICSProductInfoCallback packageInfo in packageInfos.Results)
             {
-                completed = !packageInfo.ResponsePending;
-
                 foreach (var package_value in packageInfo.Packages)
                 {
                     var package = package_value.Value;
@@ -233,12 +266,7 @@ namespace DepotDumper
                 {
                     PackageInfo.Add(package, null);
                 }
-            };
-
-            WaitUntilCallback(() =>
-            {
-                callbacks.Subscribe(steamApps.PICSGetProductInfo(new List<uint>(), packages), cbMethod);
-            }, () => { return completed; });
+            }
         }
 
         public bool RequestFreeAppLicense(uint appId)
@@ -294,38 +322,41 @@ namespace DepotDumper
             }, () => { return completed; });
         }
 
-
-        public void RequestDepotKey(uint depotId, uint appid = 0)
+        public async Task<SteamApps.DepotKeyCallback> RequestDepotKey(uint depotId, uint appid = 0)
         {
             if (DepotKeys.ContainsKey(depotId) || bAborted)
-                return;
-            bool completed = false;
+                return null;
 
-            Action<SteamApps.DepotKeyCallback> cbMethod = (depotKey) =>
+            SteamApps.DepotKeyCallback depotKey = await steamApps.GetDepotDecryptionKey(depotId, appid);
+
+            if ( new List<SteamKit2.EResult>() { EResult.Timeout, EResult.AccessDenied, EResult.Blocked, EResult.OK }.Contains(depotKey.Result) )
             {
-                completed = true;
-                Console.WriteLine("\tGot depot key for {0} result: {1}", depotKey.DepotID, depotKey.Result);
-
-
-                if (depotKey.Result == EResult.Timeout)
-                {
-                    completed = true;
-                    return;
-                }
-                else if (depotKey.Result != EResult.OK)
-                {
-                    Abort();
-                    return;
-                }
-
-                Program.sw.WriteLine($"{appid};{depotKey.DepotID};{string.Concat(depotKey.DepotKey.Select(b => b.ToString("X2")).ToArray())}");
-                DepotKeys[depotKey.DepotID] = depotKey.DepotKey;
-            };
-
-            WaitUntilCallback(() =>
+                return depotKey;
+            }
+            else
             {
-                callbacks.Subscribe(steamApps.GetDepotDecryptionKey(depotId, appid), cbMethod);
-            }, () => { return completed; });
+                Abort();
+                return null;
+            }
+        }
+
+        public async Task<SteamApps.DepotKeyCallback> TryRequestDepotKey(uint depotId, uint appid = 0)
+        {
+            SteamApps.DepotKeyCallback depotkey = null;
+            int attempt = 1;
+            while (depotkey == null && attempt <= 3)
+            {
+                try
+                {
+                    s_cts.CancelAfter(5000);
+                    depotkey = await RequestDepotKey(depotId, appid);
+                }
+                catch (TaskCanceledException)
+                {
+                }
+                attempt++;
+            }
+            return depotkey;
         }
 
         public string ResolveCDNTopLevelHost(string host)
@@ -489,7 +520,7 @@ namespace DepotDumper
 
         private void ConnectedCallback(SteamClient.ConnectedCallback connected)
         {
-            Console.WriteLine(" Done!");
+            Console.WriteLine("\nConnected to Steam! Logging in...");
             bConnecting = false;
             bConnected = true;
             if (!authenticatedUser)
@@ -499,7 +530,6 @@ namespace DepotDumper
             }
             else
             {
-                Console.Write("Logging '{0}' into Steam3...", logonDetails.Username);
                 steamUser.LogOn(logonDetails);
             }
         }
@@ -510,7 +540,7 @@ namespace DepotDumper
 
             if (disconnected.UserInitiated || bExpectingDisconnectRemote)
             {
-                Console.WriteLine("Disconnected from Steam");
+                //Console.WriteLine("Disconnected from Steam");
             }
             else if (connectionBackoff >= 10)
             {
@@ -578,7 +608,7 @@ namespace DepotDumper
                     logonDetails.AuthCode = Console.ReadLine();
                 }
 
-                Console.Write("Retrying Steam3 connection...");
+                Console.Write("Disconnected from Steam, reconnecting...");
                 Connect();
 
                 return;
@@ -597,8 +627,6 @@ namespace DepotDumper
 
                 return;
             }
-
-            Console.WriteLine(" Done!");
 
             this.seq++;
             credentials.LoggedOn = true;
@@ -620,15 +648,13 @@ namespace DepotDumper
 
                 return;
             }
-
-            Console.WriteLine("Got {0} licenses for account!", licenseList.LicenseList.Count);
             Licenses = licenseList.LicenseList;
         }
 
         private void UpdateMachineAuthCallback(SteamUser.UpdateMachineAuthCallback machineAuth)
         {
             byte[] hash = Util.SHAHash(machineAuth.Data);
-            Console.WriteLine("Got Machine Auth: {0} {1} {2} {3}", machineAuth.FileName, machineAuth.Offset, machineAuth.BytesToWrite, machineAuth.Data.Length, hash);
+            // Console.WriteLine("Got Machine Auth: {0} {1} {2} {3}", machineAuth.FileName, machineAuth.Offset, machineAuth.BytesToWrite, machineAuth.Data.Length, hash);
 
             AccountSettingsStore.Instance.SentryData[logonDetails.Username] = machineAuth.Data;
             AccountSettingsStore.Save();
@@ -665,7 +691,5 @@ namespace DepotDumper
 
             bDidReceiveLoginKey = true;
         }
-
-
     }
 }

@@ -50,14 +50,20 @@ namespace DepotDumper
                 if ( keyInfo.Key == ConsoleKey.Backspace )
                 {
                     if ( password.Length > 0 )
-                        password.Remove( password.Length - 1, 1 );
+                    {
+                        password.Remove(password.Length - 1, 1);
+                        Console.Write("\b \b");
+                    }
                     continue;
                 }
 
                 /* Printable ASCII characters only */
                 char c = keyInfo.KeyChar;
-                if ( c >= ' ' && c <= '~' )
-                    password.Append( c );
+                if (c >= ' ' && c <= '~')
+                {
+                    Console.Write("*");
+                    password.Append(c);
+                }
             } while ( keyInfo.Key != ConsoleKey.Enter );
 
             return password.ToString();
@@ -105,6 +111,15 @@ namespace DepotDumper
             return input.Aggregate( new StringBuilder(),
                 ( sb, v ) => sb.Append( v.ToString( "x2" ) )
                 ).ToString();
+        }
+
+        public static IEnumerable<IEnumerable<T>> SplitList<T>(this IEnumerable<T> input, int size = 50)
+        {
+            var me = input.ToList();
+            var list = new List<List<T>>();
+            for (int i = 0; i < me.Count; i += size)
+                list.Add(me.GetRange(i, Math.Min(size, me.Count - i)));
+            return list;
         }
     }
 }
